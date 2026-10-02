@@ -147,6 +147,72 @@ export interface Leftover {
   usedCount: number
 }
 
+/* ---------- 批次库存台账 ---------- */
+
+/** 入库计量单位：sheet=按包（每包若干张），roll=按卷（每卷可切若干张） */
+export type BatchUnit = 'sheet' | 'roll'
+
+/** 一批相纸：同规格、同入库日期、同采购单价记为一批 */
+export interface PaperBatch {
+  id: string
+  /** 批次标签（如 202609-A，随手贴在包装上对号） */
+  ref: string
+  /** 规格来源相纸 id（自定义规格可能为 'custom'；真正扣减按 wMm×hMm 匹配） */
+  paperId: string
+  paperName: string
+  wMm: number
+  hMm: number
+  kind: PaperKind
+  /** 入库按「包」还是「卷」计 */
+  unit: BatchUnit
+  /** 入库包数 / 卷数 */
+  qtyIn: number
+  /** 每包张数 / 每卷可切张数 */
+  unitsPer: number
+  /** 入库日期（ms，0 点） */
+  inAt: number
+  /** 有效期（ms，0 点；0 = 不设有效期） */
+  expiresAt: number
+  /** 采购单价：每包 / 每卷的价格（分） */
+  pricePurchaseCents: number
+  note?: string
+}
+
+/** 一笔扣减在某一批上的分摊量与该批实际单价 */
+export interface BatchAlloc {
+  batchId: string
+  /** 从该批扣掉的相纸单位数（张/切张） */
+  units: number
+  /** 扣减时该批的单位单价快照（分，允许半分等小数） */
+  unitPriceCents: number
+}
+
+export type ConsumptionStatus = 'active' | 'reverted'
+
+/** 一次排样消耗的扣减记录：一个任务在同一排样结果下只允许有一条 active 记录 */
+export interface Consumption {
+  id: string
+  taskId: string
+  taskName: string
+  paperId: string
+  paperName: string
+  wMm: number
+  hMm: number
+  kind: PaperKind
+  /** 实际扣减时刻（决定归属哪个时间段） */
+  at: number
+  /** 排样当时估的张数（扣减瞬间快照） */
+  unitsEstimated: number
+  /** 先进先出扣到的批次（按扣减顺序）；库存不足时总 units 小于 unitsEstimated */
+  allocs: BatchAlloc[]
+  /** 按各批实际单价汇总的材料成本（分） */
+  totalCents: number
+  status: ConsumptionStatus
+  revertedAt?: number
+  /** 退还原因：任务删除 / 重排换纸 / 手工退还 */
+  reason?: string
+}
+
 export interface Settings {
   gapMm: number
   kerfMm: number

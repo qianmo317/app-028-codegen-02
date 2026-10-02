@@ -5,6 +5,7 @@ import CutView from './views/CutView.vue'
 import ExportView from './views/ExportView.vue'
 import PapersView from './views/PapersView.vue'
 import SettingsView from './views/SettingsView.vue'
+import InventoryView from './views/InventoryView.vue'
 
 const routes: RouteRecordRaw[] = [
   { path: '/', name: 'new', component: NewTaskView, meta: { title: '新建任务' } },
@@ -12,6 +13,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/cut/:id', name: 'cut', component: CutView, meta: { title: '裁切步骤' } },
   { path: '/export/:id', name: 'export', component: ExportView, meta: { title: '导出' } },
   { path: '/papers', name: 'papers', component: PapersView, meta: { title: '相纸与照片尺寸库' } },
+  { path: '/inventory', name: 'inventory', component: InventoryView, meta: { title: '库存台账' } },
   { path: '/settings', name: 'settings', component: SettingsView, meta: { title: '裁切参数' } },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]

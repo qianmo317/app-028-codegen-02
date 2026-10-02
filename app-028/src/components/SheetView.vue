@@ -22,6 +22,10 @@ const props = withDefaults(
     footerText?: string
     thumbOf?: (p: Placement) => string | undefined
     labelOf?: (itemId: string) => string
+    /** 这一张纸来自哪个批次（纸面条目标注） */
+    batchTag?: { ref: string; color: string }
+    /** 库存不足、这张没扣到批次 */
+    batchMissing?: boolean
   }>(),
   {
     safeEdgeMm: 3,
@@ -40,6 +44,8 @@ const props = withDefaults(
     footerText: '',
     thumbOf: undefined,
     labelOf: undefined,
+    batchTag: undefined,
+    batchMissing: false,
   },
 )
 
@@ -181,6 +187,10 @@ const showDetail = computed(() => props.scale >= 1.6 || props.unit === 'mm')
 
 <template>
   <div class="sheet-canvas" :style="paperStyle">
+    <div v-if="batchTag" class="batch-ribbon" :style="{ background: batchTag.color }">
+      批次 {{ batchTag.ref }}
+    </div>
+    <div v-else-if="batchMissing" class="batch-ribbon missing">未扣到批次（库存不足）</div>
     <div class="sheet-grid" :style="gridStyle"></div>
     <div v-if="showSafeArea" class="sheet-safe" :style="safeStyle"></div>
 

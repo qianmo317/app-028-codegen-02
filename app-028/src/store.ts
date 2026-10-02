@@ -10,10 +10,17 @@ import {
   resolvePaper,
 } from './logic/library'
 import { pack, sheetsFromPlacements } from './logic/packer'
+import {
+  consumeFifo,
+  revertConsumption,
+  type ConsumptionIssue,
+} from './logic/inventory'
 import { loadJSON, saveJSON } from './logic/storage'
 import type {
+  Consumption,
   Leftover,
   Paper,
+  PaperBatch,
   PaperTemplate,
   PhotoRef,
   PhotoSize,
@@ -29,6 +36,8 @@ const KEY = {
   settings: 'ppis.settings.v1',
   tasks: 'ppis.tasks.v1',
   leftovers: 'ppis.leftovers.v1',
+  batches: 'ppis.batches.v1',
+  consumptions: 'ppis.consumptions.v1',
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -44,12 +53,16 @@ export const customSizes = ref<PhotoSize[]>(loadJSON<PhotoSize[]>(KEY.customSize
 export const settings = ref<Settings>({ ...DEFAULT_SETTINGS, ...loadJSON(KEY.settings, {}) })
 export const tasks = ref<Task[]>(loadJSON<Task[]>(KEY.tasks, []))
 export const leftovers = ref<Leftover[]>(loadJSON<Leftover[]>(KEY.leftovers, []))
+export const batches = ref<PaperBatch[]>(loadJSON<PaperBatch[]>(KEY.batches, []))
+export const consumptions = ref<Consumption[]>(loadJSON<Consumption[]>(KEY.consumptions, []))
 
 watch(customPapers, (v) => saveJSON(KEY.customPapers, v), { deep: true })
 watch(customSizes, (v) => saveJSON(KEY.customSizes, v), { deep: true })
 watch(settings, (v) => saveJSON(KEY.settings, v), { deep: true })
 watch(tasks, (v) => saveJSON(KEY.tasks, v), { deep: true })
 watch(leftovers, (v) => saveJSON(KEY.leftovers, v), { deep: true })
+watch(batches, (v) => saveJSON(KEY.batches, v), { deep: true })
+watch(consumptions, (v) => saveJSON(KEY.consumptions, v), { deep: true })
 
 export const allPapers = computed<Paper[]>(() => [...BUILTIN_PAPERS, ...customPapers.value])
 export const allSizes = computed<PhotoSize[]>(() => [...BUILTIN_PHOTO_SIZES, ...customSizes.value])
@@ -138,11 +151,62 @@ export function createTask(partial: Partial<Task> = {}): Task {
 }
 
 export function deleteTask(id: string): void {
+  // 任务删掉：已扣的库存必须还回去（保留退还记录，便于月底追溯）
+  rollbackConsumption(id, '任务删除')
   tasks.value = tasks.value.filter((t) => t.id !== id)
 }
 
 export function touch(): void {
   tasks.value = tasks.value.slice()
+}
+
+/* ---------------- 批次库存台账 ---------------- */
+
+export function addBatch(b: Omit<PaperBatch, 'id'>): PaperBatch {
+  const batch: PaperBatch = { ...b, id: newId('batch') }
+  batches.value = [batch, ...batches.value]
+  return batch
+}
+
+export function updateBatch(id: string, patch: Partial<PaperBatch>): void {
+  batches.value = batches.value.map((b) => (b.id === id ? { ...b, ...patch } : b))
+}
+
+/** 只有完全没被扣过的批次才允许删除，避免历史成本对不上 */
+export function removeBatch(id: string): string | undefined {
+  const used = consumptions.value.some((c) => c.allocs.some((a) => a.batchId === id))
+  if (used) return '该批已有扣减记录，不能删除（可保留或在台账里备注作废）'
+  batches.value = batches.value.filter((b) => b.id !== id)
+  return undefined
+}
+
+/** 退还任务当前的 active 扣减；没有则什么都不做 */
+export function rollbackConsumption(taskId: string, reason: string): Consumption | undefined {
+  const cur = consumptions.value.find((c) => c.taskId === taskId && c.status === 'active')
+  if (!cur) return undefined
+  const reverted = revertConsumption(cur, reason)
+  consumptions.value = consumptions.value.map((c) => (c.id === cur.id ? reverted : c))
+  return reverted
+}
+
+/**
+ * 按排样结果重新记账：先退还旧扣减，再按先进先出扣一次。
+ * 一个任务同一时刻只保留一条 active 记录（一笔消耗只能扣一次）。
+ */
+export function syncConsumption(task: Task, at?: number): ConsumptionIssue[] {
+  const paper = resolvePaper(task, allPapers.value)
+  const units = task.result?.stats.sheets ?? 0
+  rollbackConsumption(task.id, '重排/重记')
+  if (units <= 0) return []
+  const { consumption, issues } = consumeFifo(batches.value, consumptions.value, {
+    taskId: task.id,
+    taskName: task.name,
+    paper,
+    units,
+    at,
+  })
+  consumptions.value = [consumption, ...consumptions.value]
+  return issues
 }
 
 /** 执行排样；返回错误提示（无错误时返回 undefined） */
@@ -151,6 +215,8 @@ export function runPack(task: Task): string | undefined {
   const groups = groupsFromTask(task, allSizes.value)
   if (!groups.length) {
     task.result = undefined
+    // 清单清空：把此前扣过的库存还回去
+    rollbackConsumption(task.id, '清空重排')
     return '照片清单为空，请先添加照片尺寸与数量'
   }
   const out = pack(groups, optionsFromTask(task, paper))
@@ -160,9 +226,14 @@ export function runPack(task: Task): string | undefined {
   }
   task.result = out.result
   task.manual = undefined
+  // 排样定下张数后按先进先出自动扣账（重排会先退还旧账再扣新账，保证只扣一次）
+  ledgerIssues.value = syncConsumption(task)
   touch()
   return undefined
 }
+
+/** 最近一次排样/记账的库存提示（库存不足、临近有效期等） */
+export const ledgerIssues = ref<Array<{ level: string; message: string }>>([])
 
 /** 当前生效的相纸版面：手工微调优先于自动排样 */
 export function sheetsOf(task: Task): Sheet[] {

@@ -6,6 +6,7 @@ import {
   allPapers,
   allSizes,
   clearItemPhoto,
+  consumptions,
   createTask,
   deleteTask,
   getItemPhoto,
@@ -19,6 +20,7 @@ import {
   tasks,
   templates,
 } from '../store'
+import { activeConsumptionOf } from '../logic/inventory'
 import { findPhotoSize, newId } from '../logic/library'
 import { formatCents, formatPercent } from '../logic/units'
 import type { Item, Paper, PhotoRef, Task } from '../logic/types'
@@ -214,6 +216,15 @@ function submit() {
     return
   }
   router.push(`/layout/${task.id}`)
+}
+
+function ledgerState(t: Task): { text: string; cls: string } {
+  const c = activeConsumptionOf(consumptions.value, t.id)
+  const sheets = t.result?.stats.sheets ?? 0
+  if (!c || !c.allocs.length) return { text: '未扣账', cls: 'danger' }
+  const u = c.allocs.reduce((s, a) => s + a.units, 0)
+  if (u < sheets) return { text: `扣 ${u}/${sheets}`, cls: 'warn' }
+  return { text: `已扣 ${u} 张`, cls: 'ok' }
 }
 
 function openTask(t: Task, route: string) {
@@ -476,6 +487,7 @@ function taskPaperName(t: Task) {
                 <th>相纸</th>
                 <th class="num">照片</th>
                 <th class="num">张数</th>
+                <th>台账</th>
                 <th class="num">利用率</th>
                 <th></th>
               </tr>
@@ -486,6 +498,7 @@ function taskPaperName(t: Task) {
                 <td>{{ taskPaperName(t) }}</td>
                 <td class="num">{{ t.result?.stats.totalPhotos ?? 0 }}</td>
                 <td class="num">{{ t.result?.stats.sheets ?? 0 }}</td>
+                <td><span class="badge" :class="ledgerState(t).cls">{{ ledgerState(t).text }}</span></td>
                 <td class="num">
                   {{ t.result ? formatPercent(t.result.stats.avgUtilization) : '—' }}
                 </td>

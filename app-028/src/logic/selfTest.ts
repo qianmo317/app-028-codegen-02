@@ -2,11 +2,22 @@
  * 第 10 节验收标准的自动化断言（在浏览器里跑，结果直接显示在「裁切参数」页）
  */
 import { validateCutSequence, type CutLine, type Rect } from './guillotine'
+import {
+  batchBalances,
+  batchRemainingAt,
+  consumeFifo,
+  dayEnd,
+  dayStart,
+  periodReport,
+  reconcile,
+  revertConsumption,
+  sameSpec,
+} from './inventory'
 import { BUILTIN_PAPERS, BUILTIN_PHOTO_SIZES } from './library'
 import { pack, sheetsFromPlacements, usableRegion, type PackGroup, type PackOptions } from './packer'
 import { buildPdf } from './pdf'
 import { MM_TO_PT, mmToPt, mmToPx, pxToMm } from './units'
-import type { Paper, Placement, Sheet } from './types'
+import type { Paper, PaperBatch, Placement, Sheet } from './types'
 
 export interface AssertionResult {
   id: string
@@ -482,6 +493,125 @@ function assertPerformance(): AssertionResult {
   }
 }
 
+/** ⑧ 批次库存台账：FIFO 扣减、按批计价、退还回补、时间段统计与估实对账 */
+function assertInventoryLedger(): AssertionResult {
+  const t0 = performance.now()
+  const problems: string[] = []
+  const paper = BUILTIN_PAPERS.find((p) => p.id === 'p5x7') as Paper
+  const DAY = 1000 * 60 * 60 * 24
+  const d0 = dayStart(new Date('2026-09-01T00:00:00').getTime())
+  const other = BUILTIN_PAPERS.find((p) => p.id === 'pa4') as Paper
+
+  const mkBatch = (i: number, over: Partial<PaperBatch>): PaperBatch => ({
+    id: `b${i}`,
+    ref: `R${i}`,
+    paperId: paper.id,
+    paperName: paper.name,
+    wMm: paper.wMm,
+    hMm: paper.hMm,
+    kind: paper.kind,
+    unit: 'sheet',
+    qtyIn: 1,
+    unitsPer: 10,
+    inAt: d0 + i * DAY,
+    expiresAt: 0,
+    pricePurchaseCents: 1000 + i * 200,
+    ...over,
+  })
+  // 三批 5×7：10 张 ¥10/张、10 张 ¥12/张、5 张 ¥15/张；另有一批 A4 不能串规格
+  const batches = [mkBatch(0, {}), mkBatch(1, { pricePurchaseCents: 1200 }), mkBatch(2, { unitsPer: 5, pricePurchaseCents: 750 }), mkBatch(3, { id: 'bA4', ref: 'RA4', paperId: other.id, paperName: other.name, wMm: other.wMm, hMm: other.hMm, kind: other.kind })]
+
+  // 规格匹配：宽高对调也算同规格
+  if (!sameSpec(mkBatch(9, {}), { ...paper, wMm: paper.hMm, hMm: paper.wMm })) {
+    problems.push('同规格相纸旋转宽高后未被识别为同一规格')
+  }
+
+  // 第一单：用 12 张 → 扣完第 1 批 10 张 + 第 2 批 2 张
+  let r1 = consumeFifo(batches, [], { taskId: 't1', taskName: '任务一', paper, units: 12, at: d0 + 5 * DAY })
+  if (r1.issues.length) problems.push(`库存充足时不应有提示：${r1.issues[0].message}`)
+  const c1 = r1.consumption
+  if (c1.allocs.length !== 2) problems.push(`12 张应跨 2 个批次，实际 ${c1.allocs.length}`)
+  if (c1.allocs[0].batchId !== 'b0' || c1.allocs[0].units !== 10) problems.push('FIFO 第一笔应先扣最早批 b0 的 10 张')
+  if (c1.allocs[1].batchId !== 'b1' || c1.allocs[1].units !== 2) problems.push('FIFO 第二笔应从 b1 扣 2 张')
+  // 成本 = 10×100 + 2×120 = 1240 分
+  if (Math.abs(c1.totalCents - 1240) > 1e-6) problems.push(`按批汇总成本应为 1240 分，实际 ${c1.totalCents}`)
+
+  // 第二单：再用 10 张 → b1 剩 8 + b2 5 = 13 够扣
+  const r2 = consumeFifo(batches, [c1], { taskId: 't2', taskName: '任务二', paper, units: 10, at: d0 + 6 * DAY })
+  const c2 = r2.consumption
+  if (c2.allocs[0].units !== 8 || c2.allocs[1].batchId !== 'b2' || c2.allocs[1].units !== 2) {
+    problems.push('第二单应扣 b1 剩的 8 张 + b2 的 2 张')
+  }
+
+  // 第三单：库存只剩 b2 的 3 张，要 5 张 → 只扣到 3 张并报不足
+  const r3 = consumeFifo(batches, [c1, c2], { taskId: 't3', taskName: '任务三', paper, units: 5, at: d0 + 7 * DAY })
+  if (!r3.issues.some((i) => i.level === 'error')) problems.push('库存不足时必须给出 error 级提示')
+  if (r3.consumption.allocs.reduce((s, a) => s + a.units, 0) !== 3) problems.push('库存不足时应只扣到剩余 3 张')
+
+  // 余额：b0=0、b1=0、b2=0、A4 批次不受影响仍是 10
+  const bal = batchBalances(batches, [c1, c2, r3.consumption], d0 + 8 * DAY)
+  const rem = new Map(bal.map((b) => [b.batch.id, b.remaining]))
+  if (rem.get('b0') !== 0 || rem.get('b1') !== 0 || rem.get('b2') !== 0) problems.push('三批 5×7 应全部扣完')
+  if (rem.get('bA4') !== 10) problems.push('A4 批次被跨规格扣减了')
+
+  // 退还第二单：b1 回补 8、b2 回补 2
+  const c2back = revertConsumption(c2, '重排/重记', d0 + 9 * DAY)
+  const balAfter = batchBalances(batches, [c1, c2back, r3.consumption], d0 + 10 * DAY)
+  const remAfter = new Map(balAfter.map((b) => [b.batch.id, b.remaining]))
+  if (remAfter.get('b1') !== 8) problems.push(`退还后 b1 应剩 8，实际 ${remAfter.get('b1')}`)
+  if (remAfter.get('b2') !== 2) problems.push(`退还后 b2 应剩 2，实际 ${remAfter.get('b2')}`)
+
+  // 一笔消耗只能扣一次：重新记账（同 taskId）应顶替旧账而不是叠加
+  const r2b = consumeFifo(batches, [c1, c2back, r3.consumption], { taskId: 't2', taskName: '任务二重排', paper, units: 3, at: d0 + 11 * DAY })
+  if (r2b.consumption.allocs[0].batchId !== 'b1' || r2b.consumption.allocs[0].units !== 3) {
+    problems.push('同任务重记时必须排除自身旧扣减后再按 FIFO 扣')
+  }
+
+  // 时间段统计：9/05~9/07 内实际成本与张数（c1=1240/12 张，c3=3×150=450/3 张，c2 已退还不计）
+  const rep = periodReport(batches, [c1, c2back, r3.consumption], {
+    from: dayStart(d0 + 5 * DAY),
+    to: dayEnd(d0 + 7 * DAY),
+  })
+  if (rep.actualUnits !== 15) problems.push(`时间段实际用纸应为 15 张，实际 ${rep.actualUnits}`)
+  if (Math.abs(rep.actualCents - 1690) > 1e-6) problems.push(`时间段实际成本应为 1690 分，实际 ${rep.actualCents}`)
+  if (rep.estimatedUnits !== 17 || rep.diffUnits !== 2) problems.push('估 17（12+5）实 15，差 2 张（库存不足）')
+  if (!rep.batchLines.some((l) => l.ref === 'R0' && l.units === 10)) problems.push('按批汇总缺 R0 行')
+
+  // 时间点回放：9/06 之前 b1 应还剩 8
+  if (batchRemainingAt(batches[1], [c1], d0 + 5 * DAY + 1) !== 8) problems.push('时间点余额回放错误')
+
+  // 对账：估实差异要能指出原因
+  const recon = reconcile(
+    [
+      { id: 't1', name: '任务一', paperName: paper.name, sheets: 12, createdAt: c1.at },
+      { id: 't3', name: '任务三', paperName: paper.name, sheets: 5, createdAt: r3.consumption.at },
+      { id: 't4', name: '没扣账', paperName: paper.name, sheets: 2, createdAt: d0 + 12 * DAY },
+    ],
+    [c1, c2back, r3.consumption],
+  )
+  const row3 = recon.find((x) => x.taskId === 't3')
+  if (!row3?.reasons.some((m) => m.includes('库存不足'))) problems.push('对账未指出任务三库存不足')
+  const row4 = recon.find((x) => x.taskId === 't4')
+  if (!row4?.reasons.some((m) => m.includes('尚未扣减'))) problems.push('对账未指出任务四未扣账')
+  const row1 = recon.find((x) => x.taskId === 't1')
+  if (!row1 || row1.diff !== 0) problems.push('任务一账实应一致')
+
+  // 有效期提醒
+  const soon = mkBatch(4, { id: 'bSoon', ref: 'RS', inAt: d0, expiresAt: d0 + 10 * DAY, unitsPer: 10 })
+  const bs = batchBalances([soon], [], d0 + 5 * DAY)
+  if (!bs[0].shouldUseFirst || bs[0].expiryLevel !== 1) problems.push('10 天内到期且有库存的批次应标记「先用」')
+
+  return {
+    id: 'inventory',
+    title: '⑧ 批次台账：FIFO 扣减/按批计价/退还回补/时间段统计/估实对账',
+    pass: problems.length === 0,
+    detail: problems.length
+      ? problems.join('；')
+      : '三批 5×7 用 12 张 → b0×10+b1×2，成本 10×¥1.00+2×¥1.20=¥12.40；库存不足只扣到 3 张并报错；重排退还后 b1 回补 8、b2 回补 2；时间段 15 张/¥16.90 与估 17 差 2；A4 批次不串规格；临期批次标「先用」',
+    ms: Math.round(performance.now() - t0),
+  }
+}
+
 export async function runSelfTest(): Promise<AssertionResult[]> {
   const results: AssertionResult[] = []
   results.push(assertGuillotine())
@@ -489,6 +619,7 @@ export async function runSelfTest(): Promise<AssertionResult[]> {
   results.push(assertSafeEdgeAndKerf())
   results.push(assertUnits())
   results.push(assertCoEdgeMerge())
+  results.push(assertInventoryLedger())
   try {
     results.push(await assertExport1to1())
   } catch (e) {

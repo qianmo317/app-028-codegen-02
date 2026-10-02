@@ -7,14 +7,20 @@ import {
   addLeftover,
   allPapers,
   allSizes,
+  batches,
+  consumptions,
   getTask,
+  ledgerIssues,
   makeThumbResolver,
   manualPlacementsOf,
   resetManual,
+  rollbackConsumption,
   setManual,
   sheetsOf,
+  syncConsumption,
   photoVersion,
 } from '../store'
+import { activeConsumptionOf, batchColor, batchOfSheet } from '../logic/inventory'
 import { comparePapers, computeCost } from '../logic/cost'
 import { findPhotoSize, groupsFromTask, resolvePaper, sizeLabel } from '../logic/library'
 import { formatCents, formatPercent } from '../logic/units'
@@ -243,6 +249,41 @@ const info = computed(selectedInfo)
 const manual = computed(() => task.value?.manual)
 const lowUtil = computed(() => (sheet.value ? sheet.value.utilization < 0.7 : false))
 
+/* ---------------- 库存台账：FIFO 扣账与批次归属 ---------------- */
+
+const ledger = computed(() => (task.value ? activeConsumptionOf(consumptions.value, task.value.id) : undefined))
+const ledgerUnit = computed(() => (ledger.value ? ledger.value.allocs.reduce((s, a) => s + a.units, 0) : 0))
+const ledgerShort = computed(() => sheets.value.length - ledgerUnit.value)
+
+/** 每一张纸（按排样顺序）来自哪批，供纸面角标使用 */
+const sheetBatchOf = (sheetIndex: number) => {
+  if (!task.value) return { tag: undefined as { ref: string; color: string } | undefined, missing: false }
+  const hit = batchOfSheet(consumptions.value, task.value.id, sheetIndex)
+  if (hit) {
+    const b = batches.value.find((x) => x.id === hit.alloc.batchId)
+    return { tag: { ref: b?.ref ?? '?', color: batchColor(hit.alloc.batchId) }, missing: false }
+  }
+  return { tag: undefined, missing: sheetIndex < sheets.value.length }
+}
+const batchById = (id: string) => batches.value.find((b) => b.id === id)
+
+function reAccount() {
+  const t = task.value
+  if (!t?.result) return
+  ledgerIssues.value = syncConsumption(t)
+  localMsg.value = ledgerIssues.value.length
+    ? ledgerIssues.value.map((i) => i.message).join('；')
+    : '已按当前排样重新记账（先退还旧扣减，再按先进先出扣一次）'
+}
+function giveBack() {
+  const t = task.value
+  if (!t) return
+  if (rollbackConsumption(t.id, '手工退还')) localMsg.value = '已把这单扣掉的相纸全部退还库存'
+}
+function gotoInventory() {
+  router.push('/inventory')
+}
+
 function goto(routeName: string) {
   const t = task.value
   if (t) router.push(`/${routeName}/${t.id}`)
@@ -282,6 +323,9 @@ watch(
     </div>
 
     <div v-if="localMsg" class="note">{{ localMsg }}</div>
+    <div v-for="(iss, i) in ledgerIssues" :key="i" class="note" :class="iss.level === 'error' ? 'danger' : 'warn'">
+      台账：{{ iss.message }}
+    </div>
     <div
       v-if="manual"
       class="note"
@@ -320,6 +364,8 @@ watch(
               :scale="scale"
               draggable
               :show-cut-labels="true"
+              :batch-tag="sheetBatchOf(activeSheet).tag"
+              :batch-missing="sheetBatchOf(activeSheet).missing && !sheetBatchOf(activeSheet).tag"
               :thumb-of="thumbs"
               @move="onMove"
               @moveend="onMoveEnd"
@@ -331,6 +377,10 @@ watch(
             <span><i style="background: #6d7c8f"></i>照片边界</span>
             <span><i style="background: #c3ccd9"></i>安全边</span>
             <span>↻ = 已旋转 90°</span>
+            <span v-if="sheetBatchOf(activeSheet).tag">
+              <i :style="{ background: sheetBatchOf(activeSheet).tag!.color }"></i>本张来自批次
+              <strong>{{ sheetBatchOf(activeSheet).tag!.ref }}</strong>
+            </span>
           </div>
         </div>
 
@@ -439,6 +489,58 @@ watch(
             <dt>节省</dt>
             <dd>{{ formatCents(cost.savedCents) }}</dd>
           </div>
+          <div class="note warn" style="margin-top: 8px">
+            上面是按固定单价的旧算法；下方「库存扣账」才是按实际扣到批次的真实成本。
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>
+            库存扣账（先进先出）
+            <span class="row tight">
+              <button class="btn small" @click="reAccount">重新记账</button>
+              <button class="btn small" :disabled="!ledger" @click="giveBack">退还库存</button>
+            </span>
+          </h3>
+          <div class="card-sub">
+            排样定下 {{ sheets.length }} 张后按入库先后从最早一批扣；一笔消耗只扣一次，重排/删除会先把已扣的还回去
+          </div>
+          <div v-if="!ledger" class="note danger">
+            本单尚未扣到库存（该规格无批次或库存不足）。
+            <button class="btn small" style="margin-left: 6px" @click="gotoInventory">去登记入库</button>
+            <button class="btn small" style="margin-left: 6px" @click="reAccount">入库后重新记账</button>
+          </div>
+          <template v-else>
+            <div v-if="ledgerShort > 0" class="note danger">
+              库存不足：估 {{ sheets.length }} 张，只扣到 {{ ledgerUnit }} 张，缺 {{ ledgerShort }} 张
+            </div>
+            <table class="data">
+              <thead>
+                <tr><th>批次</th><th class="num">扣减</th><th class="num">单位价</th><th class="num">小计</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="a in ledger.allocs" :key="a.batchId">
+                  <td>
+                    <span class="badge" :style="{ background: batchColor(a.batchId) }">
+                      {{ batchById(a.batchId)?.ref ?? '?' }}
+                    </span>
+                  </td>
+                  <td class="num">{{ a.units }} 张</td>
+                  <td class="num">{{ formatCents(Math.round(a.unitPriceCents)) }}</td>
+                  <td class="num">{{ formatCents(Math.round(a.units * a.unitPriceCents)) }}</td>
+                </tr>
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td><strong>实际成本</strong></td>
+                  <td class="num"><strong>{{ ledgerUnit }} 张</strong></td>
+                  <td></td>
+                  <td class="num"><strong>{{ formatCents(Math.round(ledger.totalCents)) }}</strong></td>
+                </tr>
+              </tfoot>
+            </table>
+            <div class="note">记账时间：{{ new Date(ledger.at).toLocaleString() }}</div>
+          </template>
         </div>
 
         <div class="card">

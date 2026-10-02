@@ -6,14 +6,20 @@ import SheetView from '../components/SheetView.vue'
 import {
   allPapers,
   allSizes,
+  batches,
+  consumptions,
   getTask,
   makePhotoResolver,
   makeThumbResolver,
   photoVersion,
   sheetsOf,
+  syncConsumption,
+  ledgerIssues,
 } from '../store'
 import { computeCost } from '../logic/cost'
 import { cutListRows, csvBlob } from '../logic/csv'
+import { taskCostRows } from '../logic/inventoryCsv'
+import { activeConsumptionOf, batchColor, batchOfSheet } from '../logic/inventory'
 import { downloadBlob } from '../logic/image'
 import { findPhotoSize, resolvePaper } from '../logic/library'
 import { buildPdf } from '../logic/pdf'
@@ -133,6 +139,27 @@ async function exportAllPng() {
   }
 }
 
+const ledger = computed(() => (task.value ? activeConsumptionOf(consumptions.value, task.value.id) : undefined))
+const ledgerUnits = computed(() =>
+  ledger.value ? ledger.value.allocs.reduce((s, a) => s + a.units, 0) : 0,
+)
+function sheetBatchOf(i: number) {
+  if (!task.value) return undefined
+  const hit = batchOfSheet(consumptions.value, task.value.id, i)
+  if (!hit) return undefined
+  const b = batches.value.find((x) => x.id === hit.alloc.batchId)
+  return { ref: b?.ref ?? '?', color: batchColor(hit.alloc.batchId) }
+}
+
+function reAccount() {
+  const t = task.value
+  if (!t?.result) return
+  ledgerIssues.value = syncConsumption(t)
+  message.value = ledgerIssues.value.length
+    ? ledgerIssues.value.map((i) => i.message).join('；')
+    : '已按当前排样重新记账'
+}
+
 function exportCutList() {
   if (!guard()) return
   const rows = cutListRows(task.value!, paper.value, sheets.value, (seq) => {
@@ -146,33 +173,15 @@ function exportCutList() {
   message.value = '切割清单 CSV 已导出'
 }
 
+/** 成本清单（带批次）：每张纸来自哪批、按各批实际单价汇总 */
 function exportCost() {
   const t = task.value
-  const c = cost.value
-  if (!t || !c) return
-  const rows: Array<Array<string | number>> = [
-    ['任务', t.name],
-    ['相纸', c.paperName],
-    ['相纸单价（元）', (paper.value.priceCents / 100).toFixed(2)],
-    ['用纸张数', c.sheets],
-    ['照片总数', c.totalPhotoCount],
-    ['总材料成本（元）', (c.totalCents / 100).toFixed(2)],
-    ['每张照片摊薄成本（元）', (c.perPhotoCents / 100).toFixed(4)],
-    ['本方案利用率', formatPercent(t.result?.stats.avgUtilization ?? 0)],
-    ['本方案浪费率', formatPercent(c.wasteRate)],
-    ['不排样逐张打印成本（元）', (c.naiveTotalCents / 100).toFixed(2)],
-    ['不排样逐张打印浪费率', formatPercent(c.naiveWasteRate)],
-    ['节省（元）', (c.savedCents / 100).toFixed(2)],
-    [],
-    ['照片编号', '所在相纸', '尺寸', '宽 mm', '高 mm', '旋转'],
-  ]
-  for (const s of sheets.value) {
-    for (const p of s.placements) {
-      rows.push([p.seq, s.index + 1, sizeLabelOf(p), p.w, p.h, p.rotated ? '90°' : '无'])
-    }
-  }
-  downloadBlob(csvBlob(rows), `${task.value!.name}-成本表.csv`)
-  message.value = '成本表 CSV 已导出'
+  if (!t) return
+  const rows = taskCostRows(t.name, ledger.value, sheets.value.length, batches.value)
+  downloadBlob(csvBlob(rows), `${t.name}-成本清单(带批次).csv`)
+  message.value = ledger.value
+    ? `成本清单已导出：实际扣 ${ledgerUnits.value} 张，按批次实际成本 ¥${(ledger.value.totalCents / 100).toFixed(2)}`
+    : '成本清单已导出：本单未扣到任何批次（库存不足或未入库）'
 }
 
 function printView() {
@@ -248,22 +257,33 @@ function printView() {
         </div>
 
         <div class="card">
-          <h3>成本表</h3>
-          <div v-if="cost" class="kv">
-            <dt>相纸单价</dt>
-            <dd>{{ formatCents(paper.priceCents) }}/张</dd>
-            <dt>用纸张数</dt>
-            <dd>{{ cost.sheets }}</dd>
-            <dt>总材料成本</dt>
-            <dd>{{ formatCents(cost.totalCents) }}</dd>
-            <dt>每张照片摊薄</dt>
-            <dd>{{ formatCents(cost.perPhotoCents) }}</dd>
-            <dt>本方案浪费率</dt>
-            <dd>{{ formatPercent(cost.wasteRate) }}</dd>
-            <dt>逐张打印浪费率</dt>
-            <dd>{{ formatPercent(cost.naiveWasteRate) }}</dd>
-            <dt>对比逐张打印节省</dt>
-            <dd>{{ formatCents(cost.savedCents) }}</dd>
+          <h3>
+            成本表（按批次实际计价）
+            <button class="btn small" style="margin-left: 8px" @click="reAccount">按当前排样重新记账</button>
+          </h3>
+          <div v-if="ledger" class="kv">
+            <template v-for="a in ledger.allocs" :key="a.batchId">
+              <dt>
+                批次
+                <span class="badge" :style="{ background: batchColor(a.batchId) }">
+                  {{ batches.find((b) => b.id === a.batchId)?.ref ?? '?' }}
+                </span>
+              </dt>
+              <dd>{{ a.units }} 张 × {{ formatCents(Math.round(a.unitPriceCents)) }}</dd>
+            </template>
+            <dt>实际用纸</dt>
+            <dd><strong>{{ ledgerUnits }} 张</strong>（排样估 {{ sheets.length }} 张）</dd>
+            <dt>实际材料成本</dt>
+            <dd><strong>{{ formatCents(Math.round(ledger.totalCents)) }}</strong></dd>
+          </div>
+          <div v-else class="note danger">
+            本单未扣到任何批次：该规格无入库或库存不足。先到「库存台账」登记入库，再点上方「重新记账」。
+          </div>
+          <div v-if="ledger && ledgerUnits < sheets.length" class="note danger">
+            库存不足：缺 {{ sheets.length - ledgerUnits }} 张没扣到，成本清单里会标出来
+          </div>
+          <div class="card-sub" style="margin-top: 6px">
+            固定单价口径（旧）：{{ cost ? formatCents(cost.totalCents) : '—' }}，仅用于对比；导出的成本清单以批次实际成本为准
           </div>
         </div>
       </div>
@@ -272,8 +292,12 @@ function printView() {
         <h3>排样示意图（带编号）</h3>
         <div class="card-sub">每张照片都有编号，和清单一一对应，方便对号入座</div>
         <div v-for="s in sheets" :key="s.index" style="margin-bottom: 16px">
-          <div class="row" style="margin-bottom: 6px">
+          <div class="row">
             <span class="badge">第 {{ s.index + 1 }} 张</span>
+            <span v-if="sheetBatchOf(s.index)" class="badge" :style="{ background: sheetBatchOf(s.index)!.color }">
+              批次 {{ sheetBatchOf(s.index)!.ref }}
+            </span>
+            <span v-else class="badge danger">未扣到批次</span>
             <span class="badge">{{ s.cutSteps.length }} 刀</span>
             <span class="badge">利用率 {{ formatPercent(s.utilization) }}</span>
           </div>
@@ -283,6 +307,8 @@ function printView() {
               :paper="paper"
               :safe-edge-mm="task.safeEdgeMm"
               :scale="Math.max(0.5, Math.min(2.2, 700 / paper.wMm))"
+              :batch-tag="sheetBatchOf(s.index)"
+              :batch-missing="!sheetBatchOf(s.index)"
               :thumb-of="thumbs"
             />
           </div>
@@ -303,6 +329,8 @@ function printView() {
           :show-cut-labels="true"
           :header-text="task.headerText"
           :footer-text="task.footerText"
+          :batch-tag="sheetBatchOf(s.index)"
+          :batch-missing="!sheetBatchOf(s.index)"
           :thumb-of="thumbs"
         />
       </div>
