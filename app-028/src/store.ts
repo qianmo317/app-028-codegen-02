@@ -11,15 +11,25 @@ import {
 } from './logic/library'
 import { pack, sheetsFromPlacements } from './logic/packer'
 import { loadJSON, saveJSON } from './logic/storage'
+import {
+  allocationsFromPlan,
+  batchTotalSheets,
+  isValidDateStr,
+  planFifo,
+  specKey,
+  todayStr,
+} from './logic/inventory'
 import type {
   Leftover,
   Paper,
+  PaperBatch,
   PaperTemplate,
   PhotoRef,
   PhotoSize,
   Placement,
   Settings,
   Sheet,
+  StockConsumption,
   Task,
 } from './logic/types'
 
@@ -29,6 +39,8 @@ const KEY = {
   settings: 'ppis.settings.v1',
   tasks: 'ppis.tasks.v1',
   leftovers: 'ppis.leftovers.v1',
+  batches: 'ppis.batches.v1',
+  consumptions: 'ppis.consumptions.v1',
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -44,12 +56,16 @@ export const customSizes = ref<PhotoSize[]>(loadJSON<PhotoSize[]>(KEY.customSize
 export const settings = ref<Settings>({ ...DEFAULT_SETTINGS, ...loadJSON(KEY.settings, {}) })
 export const tasks = ref<Task[]>(loadJSON<Task[]>(KEY.tasks, []))
 export const leftovers = ref<Leftover[]>(loadJSON<Leftover[]>(KEY.leftovers, []))
+export const batches = ref<PaperBatch[]>(loadJSON<PaperBatch[]>(KEY.batches, []))
+export const consumptions = ref<StockConsumption[]>(loadJSON<StockConsumption[]>(KEY.consumptions, []))
 
-watch(customPapers, (v) => saveJSON(KEY.customPapers, v), { deep: true })
-watch(customSizes, (v) => saveJSON(KEY.customSizes, v), { deep: true })
-watch(settings, (v) => saveJSON(KEY.settings, v), { deep: true })
-watch(tasks, (v) => saveJSON(KEY.tasks, v), { deep: true })
-watch(leftovers, (v) => saveJSON(KEY.leftovers, v), { deep: true })
+watch(customPapers, (v) => saveJSON(KEY.customPapers, v), { deep: true, flush: "sync" })
+watch(customSizes, (v) => saveJSON(KEY.customSizes, v), { deep: true, flush: "sync" })
+watch(settings, (v) => saveJSON(KEY.settings, v), { deep: true, flush: "sync" })
+watch(tasks, (v) => saveJSON(KEY.tasks, v), { deep: true, flush: "sync" })
+watch(leftovers, (v) => saveJSON(KEY.leftovers, v), { deep: true, flush: "sync" })
+watch(batches, (v) => saveJSON(KEY.batches, v), { deep: true, flush: "sync" })
+watch(consumptions, (v) => saveJSON(KEY.consumptions, v), { deep: true, flush: "sync" })
 
 export const allPapers = computed<Paper[]>(() => [...BUILTIN_PAPERS, ...customPapers.value])
 export const allSizes = computed<PhotoSize[]>(() => [...BUILTIN_PHOTO_SIZES, ...customSizes.value])
@@ -137,7 +153,9 @@ export function createTask(partial: Partial<Task> = {}): Task {
   return task
 }
 
+/** 删除任务：若已扣减库存，先把纸还回批次（void 留痕） */
 export function deleteTask(id: string): void {
+  voidConsumptionsOfTask(id, '任务已删除，库存自动还回')
   tasks.value = tasks.value.filter((t) => t.id !== id)
 }
 
@@ -145,7 +163,11 @@ export function touch(): void {
   tasks.value = tasks.value.slice()
 }
 
-/** 执行排样；返回错误提示（无错误时返回 undefined） */
+/**
+ * 执行排样；返回错误提示（无错误时返回 undefined）。
+ * 任务此前已过账扣减过库存时，重排会先把已扣的批次还回（void 留痕），
+ * 由排样页按新张数重新走「扣减库存」——一笔消耗只能扣一次。
+ */
 export function runPack(task: Task): string | undefined {
   const paper = resolvePaper(task, allPapers.value)
   const groups = groupsFromTask(task, allSizes.value)
@@ -158,8 +180,12 @@ export function runPack(task: Task): string | undefined {
     task.result = undefined
     return out.error
   }
+  // 重排：先还回此前已扣的库存
+  voidConsumptionsOfTask(task.id, '排样已重排，原扣减自动还回，请按新张数重新扣减')
   task.result = out.result
   task.manual = undefined
+  // 只在任务第一次排样成功时锁定「排样当时估的张数」，供月底对账
+  if (task.initialSheetCount === undefined) task.initialSheetCount = out.result.sheets.length
   touch()
   return undefined
 }
@@ -244,3 +270,115 @@ export function markLeftoverUsed(id: string): void {
     l.id === id ? { ...l, usedCount: l.usedCount + 1 } : l,
   )
 }
+
+/* ===================== 库存台账 ===================== */
+
+function nextBatchCode(): string {
+  const prefix = todayStr().slice(0, 7).replace('-', '')
+  const n =
+    batches.value.filter((b) => b.code.startsWith(prefix)).length + 1
+  return `${prefix}-${String(n).padStart(2, '0')}`
+}
+
+export function addBatch(
+  input: Omit<PaperBatch, 'id' | 'code'> & { code?: string },
+): PaperBatch {
+  const batch: PaperBatch = {
+    ...input,
+    id: newId('batch'),
+    code: input.code?.trim() || nextBatchCode(),
+  }
+  batches.value = [...batches.value, batch]
+  return batch
+}
+
+export function removeBatch(id: string): void {
+  batches.value = batches.value.filter((b) => b.id !== id)
+}
+
+/** 该任务当前已过账（库存已扣、未还回）的消耗 */
+export function postedConsumptionOfTask(taskId: string): StockConsumption | undefined {
+  return consumptions.value.find((c) => c.taskId === taskId && c.status === 'posted')
+}
+
+export interface PostResult {
+  consumption?: StockConsumption
+  error?: string
+}
+
+/**
+ * 按 FIFO 过账一笔消耗：从最早批次扣减，记录各批分别的成本。
+ * 一笔任务只能有一条 posted 消耗（只扣一次）；库存不足时拒绝并返回原因。
+ */
+export function postConsumption(args: {
+  task: Task
+  sheets: number
+  date?: string
+}): PostResult {
+  const { task, sheets } = args
+  const existing = postedConsumptionOfTask(task.id)
+  if (existing) {
+    return { error: '该任务已扣减过库存（一笔消耗只能扣一次）；如需调整请先「还回」再重新扣减' }
+  }
+  const paper = resolvePaper(task, allPapers.value)
+  const date = args.date ?? todayStr()
+  if (!isValidDateStr(date)) {
+    return { error: `消耗日期「${date}」格式应为 YYYY-MM-DD` }
+  }
+  const plan = planFifo(batches.value, consumptions.value, paper.wMm, paper.hMm, paper.kind, sheets, {
+    atDate: date,
+  })
+  if (plan.error) return { error: plan.error }
+  const c: StockConsumption = {
+    id: newId('use'),
+    taskId: task.id,
+    taskName: task.name,
+    paperName: paper.name,
+    wMm: paper.wMm,
+    hMm: paper.hMm,
+    kind: paper.kind,
+    date,
+    estimatedSheets: task.initialSheetCount ?? sheets,
+    actualSheets: plan.totalSheets,
+    actualCostCents: plan.totalCostCents,
+    allocations: allocationsFromPlan(plan),
+    status: 'posted',
+    createdAt: Date.now(),
+  }
+  consumptions.value = [...consumptions.value, c]
+  return { consumption: c }
+}
+
+/** 手工还回一笔已扣消耗（重排/取消用纸时使用） */
+export function voidConsumption(id: string, reason = '手工还回库存'): void {
+  consumptions.value = consumptions.value.map((c) =>
+    c.id === id && c.status === 'posted'
+      ? { ...c, status: 'void', voidedAt: Date.now(), voidReason: reason }
+      : c,
+  )
+}
+
+/** 还回某任务全部已过账消耗（删除任务 / 重排前自动调用） */
+export function voidConsumptionsOfTask(taskId: string, reason: string): void {
+  if (!consumptions.value.some((c) => c.taskId === taskId && c.status === 'posted')) return
+  const now = Date.now()
+  consumptions.value = consumptions.value.map((c) =>
+    c.taskId === taskId && c.status === 'posted'
+      ? { ...c, status: 'void', voidedAt: now, voidReason: reason }
+      : c,
+  )
+}
+
+/** 规格 -> 当前库存总张数（用于排样页提示够不够用） */
+export function stockForPaper(wMm: number, hMm: number, kind: 'sheet' | 'roll'): number {
+  const key = specKey(wMm, hMm, kind)
+  const used = new Map<string, number>()
+  for (const c of consumptions.value) {
+    if (c.status !== 'posted') continue
+    for (const a of c.allocations) used.set(a.batchId, (used.get(a.batchId) ?? 0) + a.sheets)
+  }
+  return batches.value
+    .filter((b) => specKey(b.wMm, b.hMm, b.kind) === key)
+    .reduce((acc, b) => acc + batchTotalSheets(b) - (used.get(b.id) ?? 0), 0)
+}
+

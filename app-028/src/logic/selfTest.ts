@@ -2,11 +2,22 @@
  * 第 10 节验收标准的自动化断言（在浏览器里跑，结果直接显示在「裁切参数」页）
  */
 import { validateCutSequence, type CutLine, type Rect } from './guillotine'
-import { BUILTIN_PAPERS, BUILTIN_PHOTO_SIZES } from './library'
+import { BUILTIN_PAPERS, BUILTIN_PHOTO_SIZES, newId } from './library'
+import {
+  availableByBatch,
+  batchBalances,
+  batchSpecKey,
+  batchTotalSheets,
+  batchUnitCostCents,
+  daysToExpire,
+  periodReport,
+  planFifo,
+  specKey,
+} from './inventory'
 import { pack, sheetsFromPlacements, usableRegion, type PackGroup, type PackOptions } from './packer'
 import { buildPdf } from './pdf'
 import { MM_TO_PT, mmToPt, mmToPx, pxToMm } from './units'
-import type { Paper, Placement, Sheet } from './types'
+import type { Paper, PaperBatch, Placement, Sheet, StockConsumption } from './types'
 
 export interface AssertionResult {
   id: string
@@ -482,6 +493,172 @@ function assertPerformance(): AssertionResult {
   }
 }
 
+/** ⑧ 库存台账：FIFO 跨批计价 / 时点结余 / 临期 / 还回 / 防重复扣 / 对账差异 */
+function assertInventoryLedger(): AssertionResult {
+  const t0 = performance.now()
+  const problems: string[] = []
+  const paper = BUILTIN_PAPERS.find((p) => p.id === 'p5x7') as Paper
+
+  let seq = 0
+  function mkBatch(partial: Partial<PaperBatch> & { inDate: string; units: number; priceCents: number }): PaperBatch {
+    seq++
+    return {
+      id: newId(`btest${seq}`),
+      code: `T${seq}`,
+      paperName: paper.name,
+      wMm: paper.wMm,
+      hMm: paper.hMm,
+      kind: 'sheet',
+      expireDate: '',
+      unit: 'sheets',
+      sheetsPerUnit: 1,
+      note: '',
+      ...partial,
+    }
+  }
+
+  // 两批同规格不同进价（散张按「每张价」登记）：早批 100 张 @100 分/张、晚批 50 张 @200 分/张
+  const b1 = mkBatch({ inDate: '2026-10-01', units: 100, priceCents: 100, expireDate: '2026-10-20' })
+  const b2 = mkBatch({ inDate: '2026-10-10', units: 50, priceCents: 200, expireDate: '2026-12-31' })
+  // 一包：5 包 × 20 张 = 100 张，每包 3000 分 → 150 分/张
+  const b3 = mkBatch({
+    inDate: '2026-10-15',
+    units: 5,
+    priceCents: 3000,
+    unit: 'pack',
+    sheetsPerUnit: 20,
+    expireDate: '',
+  })
+  const batches = [b1, b2, b3]
+
+  if (Math.abs(batchUnitCostCents(b3) - 150) > EPS) problems.push('包进价折算每张成本错误（应为 150 分/张）')
+  if (batchTotalSheets(b3) !== 100) problems.push('包数 × 每包张数 折算错误')
+
+  // 第一次领 120 张：b1 取 100（10000 分）+ b2 取 20（4000 分）= 14000 分
+  const p1 = planFifo(batches, [], paper.wMm, paper.hMm, 'sheet', 120)
+  if (p1.error) problems.push(`FIFO 试算意外失败：${p1.error}`)
+  if (p1.lines.length !== 2) problems.push(`120 张应跨 2 批，实际跨 ${p1.lines.length} 批`)
+  if (p1.lines[0]?.batch.id !== b1.id || p1.lines[0].sheets !== 100) problems.push('FIFO 未先取最早批次')
+  if (p1.lines[1]?.batch.id !== b2.id || p1.lines[1].sheets !== 20) problems.push('FIFO 第二批扣减数错误')
+  if (Math.abs(p1.totalCostCents - 14000) > EPS) problems.push(`跨批成本汇总错误：${p1.totalCostCents} ≠ 14000`)
+  const c1: StockConsumption = {
+    id: newId('c1'),
+    taskId: 'task-1',
+    taskName: '任务一',
+    paperName: paper.name,
+    wMm: paper.wMm,
+    hMm: paper.hMm,
+    kind: 'sheet',
+    date: '2026-10-12',
+    estimatedSheets: 110, // 排样当时估 110 张，实际用 120
+    actualSheets: 120,
+    actualCostCents: p1.totalCostCents,
+    allocations: p1.lines.map((l) => ({
+      batchId: l.batch.id,
+      sheets: l.sheets,
+      unitCostCents: l.unitCostCents,
+      lineCostCents: l.lineCostCents,
+    })),
+    status: 'posted',
+    createdAt: 1,
+  }
+
+  // 第二次领 50 张：b2 剩 30 全取（6000）+ b3 取 20（3000）= 9000；证明 b1 已耗尽不会再取
+  const p2 = planFifo(batches, [c1], paper.wMm, paper.hMm, 'sheet', 50, { atDate: '2026-10-16' })
+  if (p2.error) problems.push(`第二次 FIFO 失败：${p2.error}`)
+  if (p2.lines[0]?.batch.id !== b2.id || p2.lines[0].sheets !== 30) problems.push('第二次应先取 b2 结余 30 张')
+  if (p2.lines[1]?.batch.id !== b3.id || p2.lines[1].sheets !== 20) problems.push('第二次再取 b3（包折张）20 张')
+  if (Math.abs(p2.totalCostCents - 9000) > EPS) problems.push(`第二次成本错误：${p2.totalCostCents} ≠ 9000`)
+
+  // 库存不足：此时剩 b3 80 张，领 81 张必须拒绝
+  const c2: StockConsumption = {
+    id: newId('c2'),
+    taskId: 'task-2',
+    taskName: '任务二',
+    paperName: paper.name,
+    wMm: paper.wMm,
+    hMm: paper.hMm,
+    kind: 'sheet',
+    date: '2026-10-16',
+    estimatedSheets: 50,
+    actualSheets: 50,
+    actualCostCents: p2.totalCostCents,
+    allocations: p2.lines.map((l) => ({
+      batchId: l.batch.id,
+      sheets: l.sheets,
+      unitCostCents: l.unitCostCents,
+      lineCostCents: l.lineCostCents,
+    })),
+    status: 'posted',
+    createdAt: 2,
+  }
+  const pShort = planFifo(batches, [c1, c2], paper.wMm, paper.hMm, 'sheet', 81, { atDate: '2026-10-17' })
+  if (!pShort.error) problems.push('库存不足时必须拒绝过账')
+
+  // 时点结余：截至 10-13（只有 c1），b2 应剩 30；b3 尚未入库（10-15）显示 100
+  const bal13 = batchBalances(batches, [c1, c2], { atDate: '2026-10-13', today: '2026-10-18' })
+  const b2At13 = bal13.find((x) => x.batch.id === b2.id)
+  const b3At13 = bal13.find((x) => x.batch.id === b3.id)
+  if (b2At13?.remaining !== 30) problems.push(`时点结余错误：10-13 时 b2 应剩 30，实际 ${b2At13?.remaining}`)
+  if (b3At13?.existsAt !== false || b3At13.remaining !== 0) {
+    problems.push('未到入库日的批次应显示尚未入库、结余 0')
+  }
+
+  // availableByBatch 直接校验
+  const avail = availableByBatch(batches, [c1, c2], '2026-10-17')
+  if (avail.get(b1.id) !== 0 || avail.get(b2.id) !== 0 || avail.get(b3.id) !== 80) {
+    problems.push(`最终结余错误：b1=0 b2=0 b3=80，实际 ${avail.get(b1.id)}/${avail.get(b2.id)}/${avail.get(b3.id)}`)
+  }
+
+  // 临期：b1 有效期 10-20，今天 10-18 → 2 天，临期；b2 正常
+  if (daysToExpire(b1.expireDate, '2026-10-18') !== 2) problems.push('临期天数计算错误')
+  const warn = batchBalances(batches, [c1, c2], { atDate: '2026-10-17', today: '2026-10-18', warnDays: 30 })
+  const b1Status = warn.find((x) => x.batch.id === b1.id)
+  if (b1Status?.expireStatus !== 'soon') problems.push('b1 应在 30 天临期窗口内标记 soon')
+
+  // 还回（void）：c1 作废后库存应回到 c1 扣减前
+  const c1Void: StockConsumption = { ...c1, status: 'void', voidReason: '重排还回' }
+  const availAfterReturn = availableByBatch(batches, [c1Void, c2], '2026-10-17')
+  if (availAfterReturn.get(b1.id) !== 100 || availAfterReturn.get(b2.id) !== 20 || availAfterReturn.get(b3.id) !== 80) {
+    problems.push(
+      `还回后结余错误：应 100/20/80，实际 ${availAfterReturn.get(b1.id)}/${availAfterReturn.get(b2.id)}/${availAfterReturn.get(b3.id)}`,
+    )
+  }
+
+  // 规格隔离：不同规格的批次不能串
+  const other = BUILTIN_PAPERS.find((p) => specKey(p.wMm, p.hMm, p.kind) !== batchSpecKey(b1)) as Paper
+  const pOther = planFifo(batches, [c1, c2], other.wMm, other.hMm, other.kind, 1)
+  if (!pOther.error) problems.push('规格不同的批次不得参与 FIFO')
+
+  // 时段对账：实际 120 张 / 14000 分 vs 估算 110 张，差异可指出
+  const report = periodReport(batches, [c1, c2], '2026-10-01', '2026-10-31', () => paper.priceCents)
+  if (report.totalActualSheets !== 170) problems.push('时段实际张数汇总错误')
+  if (report.totalEstimatedSheets !== 160) problems.push('时段估算张数汇总错误')
+  if (report.totalVarianceSheets !== 10) problems.push('张数差异（实际-估算）应为 +10')
+  // 固定单价 150 × 170 = 25500；实际批次 14000+9000 = 23000
+  if (Math.abs(report.totalFixedCostCents - 25500) > EPS) problems.push('固定单价对照成本错误')
+  if (Math.abs(report.totalActualCostCents - 23000) > EPS) problems.push('时段实际批次成本汇总错误')
+  if (Math.abs(report.totalVarianceCostCents - (-2500)) > EPS) problems.push('成本差异应指出实际比固定单价省 2500 分')
+  const r1 = report.rows.find((r) => r.c.id === c1.id)
+  if (!r1?.reasons.length) problems.push('对账必须给出差异原因')
+
+  // 已 void 的消耗不进时段汇总
+  const reportVoid = periodReport(batches, [c1Void, c2], '2026-10-01', '2026-10-31', () => paper.priceCents)
+  if (reportVoid.totalActualSheets !== 50 || reportVoid.voidedCount !== 1) {
+    problems.push('已还回（void）的消耗必须排除在汇总外，但保留流水计数')
+  }
+
+  return {
+    id: 'inventory',
+    title: '⑧ 库存台账：FIFO 跨批计价、时点结余、临期先用、还回、一笔只扣一次、对账差异可指出',
+    pass: problems.length === 0,
+    detail: problems.length
+      ? problems.join('；')
+      : `120 张跨 b1×100@100 + b2×20@200 = 14000 分；再领 50 张取 b2 余 30 + 包折张 b3×20@150 = 9000 分；库存不足拒扣；10-13 时点 b2 余 30、b3 未入库；b1 2 天后到期标临期；void 后还回 100/20/80；规格不串；10 月实际 170 张/23000 分 vs 估 160 张/固定价 25500 分，差异 +10 张、省 2500 分且给出原因`,
+    ms: Math.round(performance.now() - t0),
+  }
+}
+
 export async function runSelfTest(): Promise<AssertionResult[]> {
   const results: AssertionResult[] = []
   results.push(assertGuillotine())
@@ -501,5 +678,6 @@ export async function runSelfTest(): Promise<AssertionResult[]> {
     })
   }
   results.push(assertPerformance())
+  results.push(assertInventoryLedger())
   return results
 }

@@ -6,14 +6,17 @@ import SheetView from '../components/SheetView.vue'
 import {
   allPapers,
   allSizes,
+  batches,
   getTask,
   makePhotoResolver,
   makeThumbResolver,
   photoVersion,
+  postedConsumptionOfTask,
   sheetsOf,
 } from '../store'
 import { computeCost } from '../logic/cost'
 import { cutListRows, csvBlob } from '../logic/csv'
+import { batchColorOf } from '../logic/inventory'
 import { downloadBlob } from '../logic/image'
 import { findPhotoSize, resolvePaper } from '../logic/library'
 import { buildPdf } from '../logic/pdf'
@@ -29,6 +32,34 @@ const paper = computed(() => (task.value ? resolvePaper(task.value, allPapers.va
 const sheets = computed(() => (task.value ? sheetsOf(task.value) : []))
 const valid = computed(() => !task.value?.manual || task.value.manual.valid)
 const cost = computed(() => (task.value?.result ? computeCost(paper.value, task.value.result) : undefined))
+const posted = computed(() => (task.value ? postedConsumptionOfTask(task.value.id) : undefined))
+
+/** 每张相纸来自哪个批次（已扣减时按真实 FIFO 明细） */
+const sheetBatches = computed(() => {
+  const map = new Map<number, { code: string; color: string }>()
+  const c = posted.value
+  if (!c || !task.value) return map
+  const ids: string[] = []
+  const seq: string[] = []
+  for (const a of c.allocations) {
+    if (!ids.includes(a.batchId)) ids.push(a.batchId)
+    for (let k = 0; k < a.sheets; k++) seq.push(a.batchId)
+  }
+  sheets.value.forEach((s, i) => {
+    const bid = seq[i]
+    if (bid) {
+      const b = batches.value.find((x) => x.id === bid)
+      map.set(s.index, { code: b?.code ?? '批次已删', color: batchColorOf(ids, bid) })
+    }
+  })
+  return map
+})
+function batchTagOf(index: number): string {
+  return sheetBatches.value.get(index)?.code ?? ''
+}
+function batchColorOfSheet(index: number): string {
+  return sheetBatches.value.get(index)?.color ?? '#1f6feb'
+}
 const dpi = ref(300)
 const busy = ref(false)
 const message = ref('')
@@ -153,10 +184,22 @@ function exportCost() {
   const rows: Array<Array<string | number>> = [
     ['任务', t.name],
     ['相纸', c.paperName],
-    ['相纸单价（元）', (paper.value.priceCents / 100).toFixed(2)],
+    ['相纸固定单价（元/张）', (paper.value.priceCents / 100).toFixed(2)],
     ['用纸张数', c.sheets],
     ['照片总数', c.totalPhotoCount],
-    ['总材料成本（元）', (c.totalCents / 100).toFixed(2)],
+    ['固定单价算法总成本（元）', (c.totalCents / 100).toFixed(2)],
+  ]
+  const pc = posted.value
+  if (pc) {
+    rows.push(
+      ['实际批次成本（元）', (pc.actualCostCents / 100).toFixed(2)],
+      ['排样当时估算张数', pc.estimatedSheets],
+      ['实际扣减张数', pc.actualSheets],
+      ['张数差异（实际-估算）', pc.actualSheets - pc.estimatedSheets],
+      ['成本差异（批次成本-固定单价）（元）', ((pc.actualCostCents - c.totalCents) / 100).toFixed(2)],
+    )
+  }
+  rows.push(
     ['每张照片摊薄成本（元）', (c.perPhotoCents / 100).toFixed(4)],
     ['本方案利用率', formatPercent(t.result?.stats.avgUtilization ?? 0)],
     ['本方案浪费率', formatPercent(c.wasteRate)],
@@ -164,15 +207,36 @@ function exportCost() {
     ['不排样逐张打印浪费率', formatPercent(c.naiveWasteRate)],
     ['节省（元）', (c.savedCents / 100).toFixed(2)],
     [],
-    ['照片编号', '所在相纸', '尺寸', '宽 mm', '高 mm', '旋转'],
-  ]
+  )
+  if (pc) {
+    rows.push(['—— 批次成本清单（先进先出，实际扣到的批次分别计价）——'])
+    rows.push(['相纸序号', '批次号', '批次规格', '入库日期', '有效期至', '该批每张单价（元）', '该批成本（元）'])
+    let cursor = 0
+    for (const a of pc.allocations) {
+      const b = batches.value.find((x) => x.id === a.batchId)
+      for (let k = 0; k < a.sheets; k++) {
+        rows.push([
+          cursor + 1,
+          b?.code ?? `批次已删除(${a.batchId})`,
+          b ? `${b.wMm}x${b.hMm}mm` : '',
+          b?.inDate ?? '',
+          b?.expireDate ?? '',
+          (a.unitCostCents / 100).toFixed(4),
+          k === 0 ? (a.lineCostCents / 100).toFixed(2) : '',
+        ])
+        cursor++
+      }
+    }
+    rows.push([])
+  }
+  rows.push(['照片编号', '所在相纸', '尺寸', '宽 mm', '高 mm', '旋转'])
   for (const s of sheets.value) {
     for (const p of s.placements) {
       rows.push([p.seq, s.index + 1, sizeLabelOf(p), p.w, p.h, p.rotated ? '90°' : '无'])
     }
   }
-  downloadBlob(csvBlob(rows), `${task.value!.name}-成本表.csv`)
-  message.value = '成本表 CSV 已导出'
+  downloadBlob(csvBlob(rows), `${task.value!.name}-成本表${pc ? '-带批次' : ''}.csv`)
+  message.value = pc ? '成本表 CSV 已导出（含批次成本清单）' : '成本表 CSV 已导出（未扣减库存，仅固定单价）'
 }
 
 function printView() {
@@ -249,12 +313,22 @@ function printView() {
 
         <div class="card">
           <h3>成本表</h3>
+          <div v-if="posted" class="note ok" style="margin-bottom: 8px">
+            已按 FIFO 实际批次计价：<strong>{{ formatCents(posted.actualCostCents) }}</strong>
+            （跨 {{ posted.allocations.length }} 个批次，排样估 {{ posted.estimatedSheets }} 张 / 实际
+            {{ posted.actualSheets }} 张）；导出的成本清单带批次
+          </div>
+          <div v-else class="note warn" style="margin-bottom: 8px">
+            尚未在排样页扣减库存，下面是旧的固定单价算法；要算真实批次成本请回到排样页点「按 FIFO 扣减库存」
+          </div>
           <div v-if="cost" class="kv">
-            <dt>相纸单价</dt>
+            <dt>相纸固定单价</dt>
             <dd>{{ formatCents(paper.priceCents) }}/张</dd>
             <dt>用纸张数</dt>
             <dd>{{ cost.sheets }}</dd>
-            <dt>总材料成本</dt>
+            <dt v-if="posted">实际批次成本</dt>
+            <dd v-if="posted">{{ formatCents(posted.actualCostCents) }}</dd>
+            <dt>固定单价成本</dt>
             <dd>{{ formatCents(cost.totalCents) }}</dd>
             <dt>每张照片摊薄</dt>
             <dd>{{ formatCents(cost.perPhotoCents) }}</dd>
@@ -274,6 +348,7 @@ function printView() {
         <div v-for="s in sheets" :key="s.index" style="margin-bottom: 16px">
           <div class="row" style="margin-bottom: 6px">
             <span class="badge">第 {{ s.index + 1 }} 张</span>
+            <span v-if="batchTagOf(s.index)" class="badge brand">批次 {{ batchTagOf(s.index) }}</span>
             <span class="badge">{{ s.cutSteps.length }} 刀</span>
             <span class="badge">利用率 {{ formatPercent(s.utilization) }}</span>
           </div>
@@ -284,6 +359,8 @@ function printView() {
               :safe-edge-mm="task.safeEdgeMm"
               :scale="Math.max(0.5, Math.min(2.2, 700 / paper.wMm))"
               :thumb-of="thumbs"
+              :batch-tag="batchTagOf(s.index)"
+              :batch-color="batchColorOfSheet(s.index)"
             />
           </div>
         </div>
@@ -304,6 +381,8 @@ function printView() {
           :header-text="task.headerText"
           :footer-text="task.footerText"
           :thumb-of="thumbs"
+          :batch-tag="batchTagOf(s.index)"
+          :batch-color="batchColorOfSheet(s.index)"
         />
       </div>
       <div class="print-sheet" style="width: 210mm; height: 297mm; padding: 15mm 0 0 15mm">

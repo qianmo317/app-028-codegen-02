@@ -7,16 +7,23 @@ import {
   addLeftover,
   allPapers,
   allSizes,
+  batches,
+  consumptions,
   getTask,
   makeThumbResolver,
   manualPlacementsOf,
+  postConsumption,
+  postedConsumptionOfTask,
   resetManual,
   setManual,
   sheetsOf,
+  stockForPaper,
+  voidConsumption,
   photoVersion,
 } from '../store'
 import { comparePapers, computeCost } from '../logic/cost'
 import { findPhotoSize, groupsFromTask, resolvePaper, sizeLabel } from '../logic/library'
+import { batchColorOf, planFifo, todayStr } from '../logic/inventory'
 import { formatCents, formatPercent } from '../logic/units'
 import type { PaperCompare } from '../logic/cost'
 import type { Placement, Task } from '../logic/types'
@@ -43,6 +50,117 @@ const rawSteps = computed(() => sheets.value.reduce((acc, s) => acc + s.rawCutCo
 const thumbs = computed(() => {
   void photoVersion.value
   return task.value ? makeThumbResolver(task.value, sheets.value) : () => undefined
+})
+
+/* ---------- 库存台账：FIFO 扣减 / 还回 / 纸面批次标记 ---------- */
+const postDate = ref(todayStr())
+const postMsg = ref('')
+const postError = ref('')
+
+const posted = computed(() => (task.value ? postedConsumptionOfTask(task.value.id) : undefined))
+const stockLeft = computed(() =>
+  task.value ? stockForPaper(paper.value.wMm, paper.value.hMm, paper.value.kind) : 0,
+)
+
+/** 按当前版面张数试算 FIFO（未过账时预览会从哪些批次取） */
+const fifoPlan = computed(() => {
+  const t = task.value
+  if (!t || !sheets.value.length) return undefined
+  if (posted.value) return undefined
+  return planFifo(
+    batches.value,
+    consumptions.value,
+    paper.value.wMm,
+    paper.value.hMm,
+    paper.value.kind,
+    sheets.value.length,
+    { atDate: postDate.value },
+  )
+})
+
+function doPost() {
+  const t = task.value
+  if (!t) return
+  postMsg.value = ''
+  postError.value = ''
+  const r = postConsumption({ task: t, sheets: sheets.value.length, date: postDate.value })
+  if (r.error) {
+    postError.value = r.error
+    return
+  }
+  postMsg.value = `已按 FIFO 扣减 ${r.consumption?.actualSheets} 张，成本 ${formatCents(
+    r.consumption?.actualCostCents ?? 0,
+  )}（一笔消耗只扣一次；删除任务或重新排样会自动还回）`
+}
+
+function doVoid() {
+  const c = posted.value
+  if (!c) return
+  voidConsumption(c.id, '排样页手工还回')
+  postMsg.value = '已还回库存，可重新扣减'
+  postError.value = ''
+}
+
+/** 每张相纸（按 FIFO 顺序）来自哪一批：已扣减用真实记录，未扣减用试算 */
+const sheetBatchMap = computed(() => {
+  const map = new Map<number, { code: string; color: string; batchId: string }>()
+  if (!task.value || !sheets.value.length) return map
+  const ids: string[] = []
+  const seq: Array<{ batchId: string }> = []
+  if (posted.value) {
+    for (const a of posted.value.allocations) {
+      if (!ids.includes(a.batchId)) ids.push(a.batchId)
+      for (let k = 0; k < a.sheets; k++) seq.push({ batchId: a.batchId })
+    }
+  } else if (fifoPlan.value && !fifoPlan.value.error) {
+    for (const l of fifoPlan.value.lines) {
+      if (!ids.includes(l.batch.id)) ids.push(l.batch.id)
+      for (let k = 0; k < l.sheets; k++) seq.push({ batchId: l.batch.id })
+    }
+  }
+  sheets.value.forEach((s, i) => {
+    const hit = seq[i]
+    if (hit) {
+      const b = batches.value.find((x) => x.id === hit.batchId)
+      map.set(s.index, {
+        code: b?.code ?? '批次已删',
+        color: batchColorOf(ids, hit.batchId),
+        batchId: hit.batchId,
+      })
+    }
+  })
+  return map
+})
+
+function batchTagOf(sheetIndex: number): string {
+  return sheetBatchMap.value.get(sheetIndex)?.code ?? ''
+}
+function batchColorOfSheet(sheetIndex: number): string {
+  return sheetBatchMap.value.get(sheetIndex)?.color ?? '#1f6feb'
+}
+
+/** 当前选中张用到的批次清单（图例） */
+const batchLegend = computed(() => {
+  const out: Array<{ code: string; color: string }> = []
+  for (const v of sheetBatchMap.value.values()) {
+    if (!out.some((x) => x.code === v.code)) out.push({ code: v.code, color: v.color })
+  }
+  return out
+})
+
+/** 未过账试算行的批次色（试算时 sheetBatchMap 已按相同 FIFO 顺序生成） */
+function planBatchColor(batchId: string): string {
+  for (const v of sheetBatchMap.value.values()) {
+    if (v.batchId === batchId) return v.color
+  }
+  return '#1f6feb'
+}
+
+/** 已扣减后又重排导致张数与扣减记录不一致时提示 */
+const stalePost = computed(() => {
+  const c = posted.value
+  if (!c || !task.value) return false
+  return c.actualSheets !== sheets.value.length
 })
 
 /** 拖动中用本地覆盖，避免每帧全量校验 */
@@ -276,6 +394,8 @@ watch(
       <span class="badge">{{ totalPhotos }} 张照片</span>
       <span class="badge">{{ sheets.length }} 张相纸</span>
       <span class="badge">{{ totalSteps }} 刀（未合并 {{ rawSteps }} 刀）</span>
+      <span v-if="posted" class="badge ok">库存已扣 {{ posted.actualSheets }} 张 · {{ formatCents(posted.actualCostCents) }}</span>
+      <span v-else class="badge warn">库存未扣</span>
       <div class="spacer"></div>
       <button class="btn" @click="goto('cut')">裁切步骤 →</button>
       <button class="btn primary" @click="goto('export')">导出 1:1 →</button>
@@ -321,6 +441,8 @@ watch(
               draggable
               :show-cut-labels="true"
               :thumb-of="thumbs"
+              :batch-tag="batchTagOf(displaySheet.index)"
+              :batch-color="batchColorOfSheet(displaySheet.index)"
               @move="onMove"
               @moveend="onMoveEnd"
               @select="(seq) => (selectedSeq = seq)"
@@ -331,6 +453,9 @@ watch(
             <span><i style="background: #6d7c8f"></i>照片边界</span>
             <span><i style="background: #c3ccd9"></i>安全边</span>
             <span>↻ = 已旋转 90°</span>
+            <span v-for="b in batchLegend" :key="b.code">
+              <i :style="{ background: b.color }"></i>批次 {{ b.code }}
+            </span>
           </div>
         </div>
 
@@ -422,7 +547,101 @@ watch(
         </div>
 
         <div class="card">
+          <h3>库存扣减（FIFO 先进先出）</h3>
+          <div class="card-sub">
+            定下用 {{ sheets.length }} 张后，从入库最早的同规格批次扣；成本按实际扣到的批次分别计价，一张纸只扣一次
+          </div>
+
+          <div v-if="posted" class="stack">
+            <div class="note ok">
+              已于 {{ posted.date }} 扣减 <strong>{{ posted.actualSheets }}</strong> 张，实际批次成本
+              <strong>{{ formatCents(posted.actualCostCents) }}</strong>
+            </div>
+            <div v-if="stalePost" class="note warn">
+              版面现在是 {{ sheets.length }} 张，与已扣减的 {{ posted.actualSheets }} 张不一致（重排过）。
+              请先「还回」再按新张数重新扣减。
+            </div>
+            <table class="data">
+              <thead>
+                <tr><th>取自批次</th><th class="num">张数</th><th class="num">每张进价</th><th class="num">小计</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="(a, i) in posted.allocations" :key="i">
+                  <td>
+                    <i
+                      class="batch-dot-sm"
+                      :style="{ background: planBatchColor(a.batchId) }"
+                    ></i>
+                    {{ batches.find((b) => b.id === a.batchId)?.code ?? '批次已删除' }}
+                  </td>
+                  <td class="num">{{ a.sheets }}</td>
+                  <td class="num">{{ formatCents(a.unitCostCents) }}</td>
+                  <td class="num">{{ formatCents(a.lineCostCents) }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="row">
+              <button class="btn" @click="doVoid">还回库存（重排/取消时用）</button>
+              <RouterLink class="btn" to="/inventory">去台账查看 →</RouterLink>
+            </div>
+          </div>
+
+          <div v-else class="stack">
+            <label class="field" style="max-width: 200px">
+              消耗日期
+              <input v-model="postDate" type="text" placeholder="YYYY-MM-DD" />
+            </label>
+            <div class="kv">
+              <dt>本次版面</dt>
+              <dd>{{ sheets.length }} 张</dd>
+              <dt>该规格当前库存</dt>
+              <dd :class="stockLeft < sheets.length ? 'text-danger' : ''">{{ stockLeft }} 张</dd>
+              <dt>排样当时估算</dt>
+              <dd>{{ task.initialSheetCount ?? sheets.length }} 张</dd>
+            </div>
+            <div v-if="fifoPlan && !fifoPlan.error" class="stack">
+              <table class="data">
+                <thead>
+                  <tr><th>将从批次取</th><th class="num">取几张</th><th class="num">每张进价</th><th class="num">小计</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="l in fifoPlan.lines" :key="l.batch.id">
+                    <td>
+                      <i class="batch-dot-sm" :style="{ background: planBatchColor(l.batch.id) }"></i>
+                      {{ l.batch.code }}
+                      <span class="dim2">（余 {{ l.available }} 张）</span>
+                    </td>
+                    <td class="num">{{ l.sheets }}</td>
+                    <td class="num">{{ formatCents(l.unitCostCents) }}</td>
+                    <td class="num">{{ formatCents(l.lineCostCents) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="note">
+                合计 <strong>{{ fifoPlan.totalSheets }}</strong> 张 · 实际批次成本
+                <strong>{{ formatCents(fifoPlan.totalCostCents) }}</strong>
+                <template v-if="cost && Math.abs(fifoPlan.totalCostCents - cost.totalCents) > 0.005">
+                  （若按旧的固定单价算是 {{ formatCents(cost.totalCents) }}，对不上的原因就是各批进价不同）
+                </template>
+              </div>
+            </div>
+            <div v-else-if="fifoPlan?.error" class="note danger">{{ fifoPlan.error }}</div>
+            <div v-if="postError" class="note danger">{{ postError }}</div>
+            <div v-if="postMsg" class="note ok">{{ postMsg }}</div>
+            <div class="row">
+              <button class="btn primary" :disabled="!!fifoPlan?.error" @click="doPost">
+                按 FIFO 扣减 {{ sheets.length }} 张库存
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
           <h3>成本核算</h3>
+          <div v-if="posted" class="note ok" style="margin-bottom: 8px">
+            本单已按批次计价：{{ formatCents(posted.actualCostCents) }}（来自
+            {{ posted.allocations.length }} 个批次），下表固定单价算法仅作对照
+          </div>
           <div v-if="cost" class="kv">
             <dt>相纸单价</dt>
             <dd>{{ formatCents(paper.priceCents) }}/张</dd>
@@ -509,3 +728,21 @@ watch(
     </div>
   </div>
 </template>
+
+<style scoped>
+.dim2 {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.text-danger {
+  color: var(--danger);
+}
+.batch-dot-sm {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+</style>

@@ -22,6 +22,10 @@ const props = withDefaults(
     footerText?: string
     thumbOf?: (p: Placement) => string | undefined
     labelOf?: (itemId: string) => string
+    /** 这一张相纸来自哪个批次（标签文字，如「202610-01」），非空时纸面四角着色带 */
+    batchTag?: string
+    /** 批次色带颜色 */
+    batchColor?: string
   }>(),
   {
     safeEdgeMm: 3,
@@ -40,6 +44,8 @@ const props = withDefaults(
     footerText: '',
     thumbOf: undefined,
     labelOf: undefined,
+    batchTag: '',
+    batchColor: '#1f6feb',
   },
 )
 
@@ -176,12 +182,21 @@ const headerFontSize = computed(() => {
   return props.unit === 'mm' ? `${mm}mm` : `${mm * props.scale}px`
 })
 
+const batchStripW = computed(() => (props.unit === 'mm' ? '2.2mm' : '7px'))
+const batchTagFont = computed(() => (props.unit === 'mm' ? '2.6mm' : '11px'))
+const batchTagStyle = computed(() => ({
+  background: props.batchColor,
+  fontSize: batchTagFont.value,
+}))
+
 const showDetail = computed(() => props.scale >= 1.6 || props.unit === 'mm')
 </script>
 
 <template>
-  <div class="sheet-canvas" :style="paperStyle">
+  <div class="sheet-canvas" :class="{ 'has-batch': !!batchTag }" :style="paperStyle">
     <div class="sheet-grid" :style="gridStyle"></div>
+    <div v-if="batchTag" class="batch-strip" :style="{ width: batchStripW, background: batchColor }"></div>
+    <div v-if="batchTag" class="batch-tag" :style="batchTagStyle">批次 {{ batchTag }}</div>
     <div v-if="showSafeArea" class="sheet-safe" :style="safeStyle"></div>
 
     <div

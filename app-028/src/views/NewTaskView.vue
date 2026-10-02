@@ -13,6 +13,7 @@ import {
   markLeftoverUsed,
   photoKey,
   photoVersion,
+  postedConsumptionOfTask,
   runPack,
   setItemPhoto,
   settings,
@@ -223,6 +224,16 @@ function openTask(t: Task, route: string) {
 function taskPaperName(t: Task) {
   if (t.paperId === 'custom' && t.customPaper) return t.customPaper.name
   return allPapers.value.find((p) => p.id === t.paperId)?.name ?? '未知相纸'
+}
+
+/** 删除任务：若已扣减库存会自动还回（deleteTask 内部 void 留痕） */
+function removeTask(t: Task) {
+  const posted = postedConsumptionOfTask(t.id)
+  const msg = posted
+    ? `任务「${t.name}」已从库存扣减 ${posted.actualSheets} 张相纸。删除任务会把这些纸自动还回对应批次。确定删除？`
+    : `确定删除任务「${t.name}」？`
+  if (!window.confirm(msg)) return
+  deleteTask(t.id)
 }
 </script>
 
@@ -482,7 +493,15 @@ function taskPaperName(t: Task) {
             </thead>
             <tbody>
               <tr v-for="t in tasks" :key="t.id">
-                <td>{{ t.name }}</td>
+                <td>
+                  {{ t.name }}
+                  <span
+                    v-if="postedConsumptionOfTask(t.id)"
+                    class="badge ok"
+                    style="margin-left: 6px"
+                    :title="`已扣 ${postedConsumptionOfTask(t.id)?.actualSheets} 张；删除任务会自动还回`"
+                  >已扣库存</span>
+                </td>
                 <td>{{ taskPaperName(t) }}</td>
                 <td class="num">{{ t.result?.stats.totalPhotos ?? 0 }}</td>
                 <td class="num">{{ t.result?.stats.sheets ?? 0 }}</td>
@@ -494,7 +513,8 @@ function taskPaperName(t: Task) {
                     <button class="btn small" @click="openTask(t, 'layout')">排样</button>
                     <button class="btn small" @click="openTask(t, 'cut')">裁切</button>
                     <button class="btn small" @click="openTask(t, 'export')">导出</button>
-                    <button class="btn small danger" @click="deleteTask(t.id)">删除</button>
+                    <button class="btn small" @click="router.push('/inventory')">台账</button>
+                    <button class="btn small danger" @click="removeTask(t)">删除</button>
                   </div>
                 </td>
               </tr>
